@@ -769,7 +769,13 @@ async fn review_history_surfaces_in_parent_session() {
     )
     .await;
     let codex_home = Arc::new(TempDir::new().unwrap());
-    let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
+    let azure_base_url = format!("{}/openai", server.uri());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), move |config| {
+        config.model_provider_id = "azure".to_string();
+        config.model_provider.name = "azure".to_string();
+        config.model_provider.base_url = Some(azure_base_url);
+    })
+    .await;
 
     // 1) Run a review turn that produces an assistant message (isolated in child).
     codex
@@ -795,7 +801,7 @@ async fn review_history_surfaces_in_parent_session() {
     .await;
     let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    // 2) Continue in the parent session; request input must not include any review items.
+    // 2) Continue in the parent session; request input must include the review summary.
     let followup = "back to parent".to_string();
     codex
         .submit(Op::UserInput {
@@ -814,13 +820,14 @@ async fn review_history_surfaces_in_parent_session() {
 
     // Inspect the second request (parent turn) input contents.
     // Parent turns include session initial messages (user_instructions, environment_context).
-    // Critically, no messages from the review thread should appear.
+    // Review summary messages should also appear without leaking local message ids.
     let requests = request_log.requests();
     assert_eq!(requests.len(), 2);
     for request in &requests {
-        assert_eq!(request.path(), "/v1/responses");
+        assert_eq!(request.path(), "/openai/responses");
     }
     let body = requests[1].body_json();
+    assert_eq!(body["store"], serde_json::Value::Bool(true));
     let input = body["input"].as_array().expect("input array");
 
     // Must include the followup as the last item for this turn
@@ -830,18 +837,20 @@ async fn review_history_surfaces_in_parent_session() {
     assert_eq!(last_text, followup);
 
     // Ensure review-thread content is present for downstream turns.
-    let contains_review_rollout_user = input.iter().any(|msg| {
+    let review_rollout_user = input.iter().find(|msg| {
         msg["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
             .contains("User initiated a review task.")
     });
-    let contains_review_assistant = input.iter().any(|msg| {
+    let review_assistant = input.iter().find(|msg| {
         msg["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
             .contains("review assistant output")
     });
+    let contains_review_rollout_user = review_rollout_user.is_some();
+    let contains_review_assistant = review_assistant.is_some();
     assert!(
         contains_review_rollout_user,
         "review rollout user message missing from parent turn input"
@@ -849,6 +858,16 @@ async fn review_history_surfaces_in_parent_session() {
     assert!(
         contains_review_assistant,
         "review assistant output missing from parent turn input"
+    );
+    assert_eq!(
+        review_rollout_user.and_then(|msg| msg.get("id")),
+        None,
+        "local review user message id must not be sent to Responses API"
+    );
+    assert_eq!(
+        review_assistant.and_then(|msg| msg.get("id")),
+        None,
+        "local review assistant message id must not be sent to Responses API"
     );
 
     let _codex_home_guard = codex_home;

@@ -915,6 +915,14 @@ impl ModelClient {
     }
 
     fn prepare_response_items_for_request(&self, input: &mut [ResponseItem], store: bool) {
+        for item in input.iter_mut() {
+            if let ResponseItem::Message { id: Some(id), .. } = item
+                && !id.starts_with("msg")
+            {
+                item.set_id(/*new_id*/ None);
+            }
+        }
+
         if self.state.item_ids_enabled || store {
             return;
         }

@@ -2936,7 +2936,7 @@ async fn includes_developer_instructions_message_in_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn azure_responses_request_includes_store_and_reasoning_ids() {
+async fn azure_responses_request_preserves_supported_ids_and_strips_local_message_ids() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
@@ -3026,10 +3026,19 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         internal_chat_message_metadata_passthrough: None,
     });
     prompt.input.push(ResponseItem::Message {
-        id: Some("message-id".into()),
+        id: Some("review_rollout_user".into()),
         role: "assistant".into(),
         content: vec![ContentItem::OutputText {
-            text: "message".into(),
+            text: "local message".into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    });
+    prompt.input.push(ResponseItem::Message {
+        id: Some("msg_server_message".into()),
+        role: "assistant".into(),
+        content: vec![ContentItem::OutputText {
+            text: "server message".into(),
         }],
         phase: None,
         internal_chat_message_metadata_passthrough: None,
@@ -3113,19 +3122,23 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
 
     assert_eq!(body["store"], serde_json::Value::Bool(true));
     assert_eq!(body["stream"], serde_json::Value::Bool(true));
-    assert_eq!(body["input"].as_array().map(Vec::len), Some(8));
+    assert_eq!(body["input"].as_array().map(Vec::len), Some(9));
     assert_eq!(body["input"][0]["id"].as_str(), Some("reasoning-id"));
-    assert_eq!(body["input"][1]["id"].as_str(), Some("message-id"));
-    assert_eq!(body["input"][2]["id"].as_str(), Some("web-search-id"));
-    assert_eq!(body["input"][3]["id"].as_str(), Some("function-id"));
+    assert!(
+        body["input"][1].get("id").is_none(),
+        "local message ids should be omitted from Azure Responses requests"
+    );
+    assert_eq!(body["input"][2]["id"].as_str(), Some("msg_server_message"));
+    assert_eq!(body["input"][3]["id"].as_str(), Some("web-search-id"));
+    assert_eq!(body["input"][4]["id"].as_str(), Some("function-id"));
     assert_eq!(
-        body["input"][4]["call_id"].as_str(),
+        body["input"][5]["call_id"].as_str(),
         Some("function-call-id")
     );
-    assert_eq!(body["input"][5]["id"].as_str(), Some("local-shell-id"));
-    assert_eq!(body["input"][6]["id"].as_str(), Some("custom-tool-id"));
+    assert_eq!(body["input"][6]["id"].as_str(), Some("local-shell-id"));
+    assert_eq!(body["input"][7]["id"].as_str(), Some("custom-tool-id"));
     assert_eq!(
-        body["input"][7]["call_id"].as_str(),
+        body["input"][8]["call_id"].as_str(),
         Some("custom-tool-call-id")
     );
 }
