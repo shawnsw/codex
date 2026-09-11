@@ -45,7 +45,12 @@ use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::is_image_close_tag_text;
+use codex_protocol::models::is_image_open_tag_text;
+use codex_protocol::models::is_local_image_close_tag_text;
+use codex_protocol::models::is_local_image_open_tag_text;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TruncationPolicy;
@@ -493,20 +498,96 @@ fn build_v2_compacted_history(
         .zip(prompt_input_metadata)
         .map(|(item, metadata)| ResponseItemEnvelope { item, metadata })
         .collect::<Vec<_>>();
-    let retained = v2_history_item_groups(prompt_input)
+    let mut retained = v2_history_item_groups(prompt_input)
         .filter(|group| {
             is_retained_for_remote_compaction_v2(&group.source, retain_client_developer_messages)
         })
+        .filter_map(strip_images_for_remote_compaction)
         .flat_map(HistoryItemGroup::into_items)
         .collect::<Vec<_>>();
-    let mut retained =
-        truncate_retained_messages(retained, RETAINED_MESSAGE_TOKEN_BUDGET, image_budget);
+    retained = truncate_retained_messages(retained, RETAINED_MESSAGE_TOKEN_BUDGET, image_budget);
     let retained_image_count = retained
         .iter()
         .map(|envelope| retained_input_image_count(&envelope.item))
         .sum::<usize>();
     retained.push(ResponseItemEnvelope::new(compaction_output));
     (retained, retained_image_count)
+}
+
+fn strip_images_for_remote_compaction(
+    mut group: HistoryItemGroup<ResponseItemEnvelope>,
+) -> Option<HistoryItemGroup<ResponseItemEnvelope>> {
+    let mut images_removed = false;
+    match &mut group.source.item {
+        ResponseItem::Message {
+            content,
+            internal_chat_message_metadata_passthrough,
+            ..
+        } => {
+            let removed_content = content
+                .iter()
+                .enumerate()
+                .map(|(index, content_item)| match content_item.content() {
+                    ContentItem::InputImage { .. } => true,
+                    ContentItem::InputText { text }
+                        if is_image_open_tag_text(text) || is_local_image_open_tag_text(text) =>
+                    {
+                        content.get(index + 1).is_some_and(|next| {
+                            matches!(next.content(), ContentItem::InputImage { .. })
+                        })
+                    }
+                    ContentItem::InputText { text }
+                        if is_image_close_tag_text(text) || is_local_image_close_tag_text(text) =>
+                    {
+                        index.checked_sub(1).is_some_and(|previous| {
+                            matches!(content[previous].content(), ContentItem::InputImage { .. })
+                        })
+                    }
+                    _ => false,
+                })
+                .collect::<Vec<_>>();
+            images_removed = removed_content.iter().any(|removed| *removed);
+            let mut index = 0;
+            content.retain(|_| {
+                let retain = !removed_content[index];
+                index += 1;
+                retain
+            });
+            if content.is_empty() {
+                return None;
+            }
+            if let Some(content_item_kinds) = internal_chat_message_metadata_passthrough
+                .as_mut()
+                .and_then(|metadata| metadata.content_item_kinds.as_mut())
+            {
+                let mut index = 0;
+                content_item_kinds.retain(|_| {
+                    let retain = removed_content.get(index).is_some_and(|removed| !removed);
+                    index += 1;
+                    retain
+                });
+            }
+        }
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => {
+            if let Some(content_items) = output.content_items_mut() {
+                let content_len = content_items.len();
+                content_items.retain(|item| {
+                    !matches!(item, FunctionCallOutputContentItem::InputImage { .. })
+                });
+                images_removed = content_items.len() != content_len;
+            }
+        }
+        ResponseItem::ImageGenerationCall { result, .. } => {
+            images_removed = !result.is_empty();
+            result.clear();
+        }
+        _ => {}
+    }
+    if images_removed {
+        group.attached_notice = None;
+    }
+    Some(group)
 }
 
 pub(crate) fn is_client_authored_developer_message(item: &ResponseItemEnvelope) -> bool {
@@ -972,8 +1053,8 @@ mod tests {
     }
 
     #[test]
-    fn build_v2_compacted_history_counts_retained_input_images() {
-        let input = vec![ResponseItem::Message {
+    fn build_v2_compacted_history_strips_retained_input_images() {
+        let user_message = ResponseItem::Message {
             id: None,
             role: "user".to_string(),
             content: vec![
@@ -991,16 +1072,33 @@ mod tests {
             ],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
-        }];
+        };
+        let resize_notice = message(
+            "developer",
+            "<image_resize_notice>resized</image_resize_notice>",
+            /*phase*/ None,
+        );
         let output = ResponseItem::Compaction {
             id: None,
             encrypted_content: "new".to_string(),
             internal_chat_message_metadata_passthrough: None,
         };
 
-        let (_, retained_image_count) = build_without_metadata(input, output);
+        for image_budget in [RetainedImageBudget::Disabled, RetainedImageBudget::Enabled] {
+            let (history, retained_image_count) = build_v2_compacted_history(
+                vec![user_message.clone(), resize_notice.clone()],
+                vec![None, None],
+                output.clone(),
+                /*retain_client_developer_messages*/ false,
+                image_budget,
+            );
 
-        assert_eq!(retained_image_count, 2);
+            assert_eq!(retained_image_count, 0);
+            assert_eq!(
+                raw(history),
+                vec![message("user", "user", /*phase*/ None), output.clone()]
+            );
+        }
     }
 
     #[test]

@@ -604,12 +604,8 @@ async fn amazon_bedrock_automatic_compaction_uses_v2_responses_endpoint() -> Res
     Ok(())
 }
 
-#[test_case(None; "default_trims_images")]
-#[test_case(Some(false); "disabled_preserves_images")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_compact_v2_charges_retained_images_to_token_budget(
-    image_budget_enabled: Option<bool>,
-) -> Result<()> {
+async fn remote_compact_v2_strips_images_from_compacted_history() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let harness = TestCodexHarness::with_auto_env_builder(
@@ -617,11 +613,6 @@ async fn remote_compact_v2_charges_retained_images_to_token_budget(
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(move |config| {
                 let _ = config.features.enable(Feature::UnifiedImageBudget);
-                if let Some(enabled) = image_budget_enabled {
-                    let _ = config
-                        .features
-                        .set_enabled(Feature::CompactionImageBudget, enabled);
-                }
             }),
     )
     .await?;
@@ -707,19 +698,10 @@ async fn remote_compact_v2_charges_retained_images_to_token_budget(
             follow_up.inputs_of_type("compaction")[0]["encrypted_content"],
             "IMAGE_BUDGET_SUMMARY"
         );
-        let dropped = if image_budget_enabled.unwrap_or(true) {
-            cycle
-        } else {
-            0
-        };
-        let mut expected_images = prepared_images[dropped..].to_vec();
-        if cycle == 2 {
-            let UserInput::Image { image_url, .. } = &image_inputs[7] else {
-                unreachable!()
-            };
-            expected_images.push(image_url.clone());
-        }
-        assert_eq!(follow_up.message_input_image_urls("user"), expected_images);
+        assert!(
+            follow_up.message_input_image_urls("user").is_empty(),
+            "compacted history must not retain images"
+        );
         assert!(
             follow_up
                 .message_input_texts("user")
@@ -1076,13 +1058,16 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
         "expected v2 follow-up request to preserve retained original user messages"
     );
     assert!(
-        follow_up_request.input().windows(2).any(|items| {
-            items[0]["role"] == "user"
-                && items[0]["content"][0]["text"] == "retained image source"
-                && items[1]["role"] == "developer"
-                && items[1]["content"][0]["text"] == user_notice
-        }),
-        "expected v2 compaction to retain the user image and its adjacent resize notice"
+        follow_up_body.contains("retained image source"),
+        "expected v2 compaction to retain the user message text"
+    );
+    assert!(
+        !follow_up_body.contains(image_url),
+        "expected v2 compaction to remove retained images"
+    );
+    assert!(
+        !follow_up_body.contains(user_notice),
+        "expected v2 compaction to remove resize notices for removed images"
     );
     assert!(
         !follow_up_body.contains(unlisted_notice),
